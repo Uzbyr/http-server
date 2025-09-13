@@ -2,19 +2,24 @@
 
 import os
 import sys
+import asyncio
+import json
 from typing import List, Optional, Any, Dict
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
 from dotenv import load_dotenv
+from datetime import datetime
+import threading
+import time
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI(
     title="Mistral Agent Manager",
-    description="API pour gérer les agents Mistral - Create, List, Delete",
+    description="API pour gérer les agents Mistral - Create, List, Delete + Game Actions",
     version="1.0.0"
 )
 
@@ -33,6 +38,19 @@ MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
 
 if not MISTRAL_API_KEY:
     raise ValueError("MISTRAL_API_KEY environment variable is required")
+
+# Global state for game characters and their actions
+game_state = {
+    "characters": {},
+    "last_update": None
+}
+
+# Lock for thread-safe access to game state
+state_lock = threading.Lock()
+
+# Background task control
+cron_task = None
+cron_running = False
 
 # Pydantic models based on Mistral API documentation
 class CompletionArgs(BaseModel):
@@ -83,6 +101,19 @@ class ErrorResponse(BaseModel):
     error: str
     message: str
 
+# Game action models
+class GameAction(BaseModel):
+    type: str = Field(..., description="Type of action (move, say, emote, etc.)")
+    target: Optional[str] = Field(None, description="Target of the action")
+    content: Optional[str] = Field(None, description="Content of the action")
+
+class Character(BaseModel):
+    name: str
+    actions: List[GameAction] = []
+
+class GameStateResponse(BaseModel):
+    characters: Dict[str, Character]
+
 # HTTP client for Mistral API
 async def get_mistral_client():
     return httpx.AsyncClient(
@@ -94,18 +125,184 @@ async def get_mistral_client():
         timeout=30.0
     )
 
+# Function to get agent actions from Mistral
+async def get_agent_action(agent_id: str, agent_name: str) -> Optional[GameAction]:
+    """Get a single action from an agent"""
+    try:
+        async with await get_mistral_client() as client:
+            # Create a completion request to get an action
+            completion_data = {
+                "model": "mistral-medium-2505",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": f"""You are {agent_name}, a character in a virtual world game. 
+                        Generate a single action in JSON format. The action must be one of these types:
+                        - "move": Move to a location (target: direction, content: description)
+                        - "say": Say something (target: who to speak to, content: what to say)
+                        - "emote": Perform an emotion/gesture (target: who to emote to, content: what emotion/gesture)
+                        
+                        Return ONLY a JSON object with this exact format:
+                        {{
+                            "type": "move|say|emote",
+                            "target": "optional_target",
+                            "content": "action_description"
+                        }}
+                        
+                        Be creative and make the action interesting for a game!"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Generate your next action as {agent_name} in the game world."
+                    }
+                ],
+                "max_tokens": 150,
+                "temperature": 0.8
+            }
+            
+            response = await client.post("/chat/completions", json=completion_data)
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data["choices"][0]["message"]["content"].strip()
+                
+                # Try to parse JSON from the response
+                try:
+                    # Extract JSON from the response (in case there's extra text)
+                    start = content.find('{')
+                    end = content.rfind('}') + 1
+                    if start != -1 and end != 0:
+                        json_str = content[start:end]
+                        action_data = json.loads(json_str)
+                        
+                        return GameAction(
+                            type=action_data.get("type", "emote"),
+                            target=action_data.get("target"),
+                            content=action_data.get("content", f"{agent_name} did something")
+                        )
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Error parsing action for {agent_name}: {e}")
+                    # Fallback action
+                    return GameAction(
+                        type="emote",
+                        target="self",
+                        content=f"{agent_name} is thinking..."
+                    )
+            else:
+                print(f"Error getting action for {agent_name}: {response.status_code}")
+                return None
+                
+    except Exception as e:
+        print(f"Exception getting action for {agent_name}: {e}")
+        return None
+
+# Function to update game state with agent actions
+async def update_game_state():
+    """Update game state by fetching actions from all agents"""
+    global game_state, cron_running
+    
+    if not cron_running:
+        return
+        
+    try:
+        # Get all agents
+        async with await get_mistral_client() as client:
+            response = await client.get("/agents")
+            
+            if response.status_code == 200:
+                data = response.json()
+                agents = data if isinstance(data, list) else data.get("data", [])
+                
+                # Process agents in parallel
+                tasks = []
+                for agent in agents:
+                    agent_id = agent.get("id")
+                    agent_name = agent.get("name", f"Agent-{agent_id}")
+                    
+                    # Create character if doesn't exist
+                    char_id = f"char-{agent_id[-8:]}"  # Use last 8 chars of agent ID
+                    
+                    with state_lock:
+                        if char_id not in game_state["characters"]:
+                            game_state["characters"][char_id] = {
+                                "name": agent_name,
+                                "actions": []
+                            }
+                    
+                    # Get action for this agent
+                    task = get_agent_action(agent_id, agent_name)
+                    tasks.append((char_id, task))
+                
+                # Wait for all actions to complete
+                for char_id, task in tasks:
+                    action = await task
+                    if action:
+                        with state_lock:
+                            if char_id in game_state["characters"]:
+                                # Add new action to the beginning of the list
+                                game_state["characters"][char_id]["actions"].insert(0, action.dict())
+                                
+                                # Keep only last 10 actions per character
+                                if len(game_state["characters"][char_id]["actions"]) > 10:
+                                    game_state["characters"][char_id]["actions"] = game_state["characters"][char_id]["actions"][:10]
+                
+                # Update last update time
+                with state_lock:
+                    game_state["last_update"] = datetime.now().isoformat()
+                    
+                print(f"Updated game state with {len(agents)} agents at {game_state['last_update']}")
+                
+    except Exception as e:
+        print(f"Error updating game state: {e}")
+
+# Background cron job
+async def cron_job():
+    """Background task that runs every 5 seconds"""
+    global cron_running
+    
+    while cron_running:
+        try:
+            await update_game_state()
+            await asyncio.sleep(5)  # Wait 5 seconds
+        except Exception as e:
+            print(f"Error in cron job: {e}")
+            await asyncio.sleep(5)
+
+# Start/Stop cron job functions
+def start_cron_job():
+    """Start the background cron job"""
+    global cron_task, cron_running
+    
+    if not cron_running:
+        cron_running = True
+        cron_task = asyncio.create_task(cron_job())
+        print("Cron job started")
+
+def stop_cron_job():
+    """Stop the background cron job"""
+    global cron_task, cron_running
+    
+    if cron_running:
+        cron_running = False
+        if cron_task:
+            cron_task.cancel()
+        print("Cron job stopped")
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "message": "Mistral Agent Manager API",
+        "message": "Mistral Agent Manager API + Game Engine",
         "version": "1.0.0",
         "endpoints": {
             "create_agent": "POST /agents",
             "list_agents": "GET /agents",
             "get_agent_by_id": "GET /agents/{agent_id}",
             "get_agent_by_name": "GET /agents/search/{agent_name}",
-            "delete_agent": "DELETE /agents/{agent_id}"
+            "delete_agent": "DELETE /agents/{agent_id}",
+            "game_state": "GET /game/state",
+            "start_game": "POST /game/start",
+            "stop_game": "POST /game/stop"
         }
     }
 
@@ -354,7 +551,48 @@ async def get_agent_id_by_name(agent_name: str):
 @app.get("/health", response_model=Dict[str, str])
 async def health_check():
     """Vérification de l'état de l'API"""
-    return {"status": "healthy", "message": "API Mistral Agent Manager opérationnelle"}
+    return {"status": "healthy", "message": "API Mistral Agent Manager + Game Engine opérationnelle"}
+
+# Game endpoints
+@app.get("/game/state", response_model=GameStateResponse)
+async def get_game_state():
+    """Get the current game state with all characters and their actions"""
+    with state_lock:
+        return GameStateResponse(characters=game_state["characters"])
+
+@app.post("/game/start")
+async def start_game():
+    """Start the game cron job that fetches agent actions every 5 seconds"""
+    start_cron_job()
+    return {"message": "Game started! Agents will now generate actions every 5 seconds."}
+
+@app.post("/game/stop")
+async def stop_game():
+    """Stop the game cron job"""
+    stop_cron_job()
+    return {"message": "Game stopped! No more actions will be generated."}
+
+@app.get("/game/status")
+async def get_game_status():
+    """Get the current game status"""
+    with state_lock:
+        return {
+            "running": cron_running,
+            "characters_count": len(game_state["characters"]),
+            "last_update": game_state["last_update"]
+        }
+
+# Startup event to start the cron job automatically
+@app.on_event("startup")
+async def startup_event():
+    """Start the cron job when the server starts"""
+    start_cron_job()
+
+# Shutdown event to stop the cron job
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the cron job when the server shuts down"""
+    stop_cron_job()
 
 if __name__ == "__main__":
     import uvicorn
